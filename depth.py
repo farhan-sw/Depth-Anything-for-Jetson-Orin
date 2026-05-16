@@ -13,9 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-import tensorrt as trt
-import pycuda.autoinit # Don't remove this line
-import pycuda.driver as cuda
+import onnxruntime as ort
 from torchvision.transforms import Compose
 
 from camera import Camera
@@ -29,9 +27,10 @@ class DepthEngine:
     def __init__(
         self,
         sensor_id: int | Sequence[int] = 0,
+        video: str = None,
         input_size: int = 308,
         frame_rate: int = 15,
-        trt_engine_path: str = 'weights/depth_anything_vits14_308.trt', # Must match with the input_size
+        onnx_model_path: str = 'weights/depth_anything_vits14_308.onnx', # Must match with the input_size
         save_path: str = None,
         raw: bool = False,
         stream: bool = False,
@@ -43,7 +42,7 @@ class DepthEngine:
         sensor_id: int | Sequence[int] -> Camera sensor id
         input_size: int -> Width and height of the input tensor(e.g. 308, 364, 406, 518)
         frame_rate: int -> Frame rate of the camera(depending on inference time)
-        trt_engine_path: str -> Path to the TensorRT engine
+        onnx_model_path: str -> Path to the ONNX model
         save_path: str -> Path to save the results
         raw: bool -> Use only the raw depth map
         stream: bool -> Stream the results
@@ -51,12 +50,19 @@ class DepthEngine:
         save: bool -> Save the results
         grayscale: bool -> Convert the depth map to grayscale
         """
-        # Initialize the camera
-        self.camera = Camera(sensor_id=sensor_id, frame_rate=frame_rate)
+        # Initialize the camera or video
+        if video is not None:
+            self.cap = cv2.VideoCapture(video)
+            self._width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self._height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.camera = None
+        else:
+            self.camera = Camera(sensor_id=sensor_id, frame_rate=frame_rate)
+            self.cap = self.camera.cap[0]
+            self._width = self.camera._width # width of the camera frame
+            self._height = self.camera._height # height of the camera frame
         self.width = input_size # width of the input tensor
         self.height = input_size # height of the input tensor
-        self._width = self.camera._width # width of the camera frame
-        self._height = self.camera._height # height of the camera frame
         self.save_path = Path(save_path) if isinstance(save_path, str) else Path("results")
         self.raw = raw
         self.stream = stream
@@ -69,22 +75,13 @@ class DepthEngine:
         # For visualization, change raw to False
         if raw: self.raw_depth = None 
         
-        # Load the TensorRT engine
-        self.runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING)) 
-        self.engine = self.runtime.deserialize_cuda_engine(open(trt_engine_path, 'rb').read())
-        self.context = self.engine.create_execution_context()
-        print(f"Engine loaded from {trt_engine_path}")
-        
-        # Allocate pagelocked memory
-        self.h_input = cuda.pagelocked_empty(trt.volume((1, 3, self.width, self.height)), dtype=np.float32)
-        self.h_output = cuda.pagelocked_empty(trt.volume((1, 1, self.width, self.height)), dtype=np.float32)
-        
-        # Allocate device memory
-        self.d_input = cuda.mem_alloc(self.h_input.nbytes)
-        self.d_output = cuda.mem_alloc(self.h_output.nbytes)
-        
-        # Create a cuda stream
-        self.cuda_stream = cuda.Stream()
+        # Load the ONNX model
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self.session = ort.InferenceSession(onnx_model_path, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        print(f"ONNX model loaded from {onnx_model_path}")
+        print(f"Using providers: {self.session.get_providers()}")
         
         # Transform functions
         self.transform = Compose([
@@ -149,40 +146,52 @@ class DepthEngine:
         
     def infer(self, image: np.ndarray) -> np.ndarray:
         """
-        Infer depth from an image using TensorRT
+        Infer depth from an image using ONNX Runtime
         """
         # Preprocess the image
         image = self.preprocess(image)
         
         t0 = time.time()
         
-        # Copy the input image to the pagelocked memory
-        np.copyto(self.h_input, image.ravel())
+        # Run inference using ONNX Runtime
+        output = self.session.run([self.output_name], {self.input_name: image})[0]
         
-        # Copy the input to the GPU, execute the inference, and copy the output back to the CPU
-        cuda.memcpy_htod_async(self.d_input, self.h_input, self.cuda_stream)
-        self.context.execute_async_v2(bindings=[int(self.d_input), int(self.d_output)], stream_handle=self.cuda_stream.handle)
-        cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.cuda_stream)
-        self.cuda_stream.synchronize()
+        self.infer_time = time.time() - t0
         
-        print(f"Inference time: {time.time() - t0:.4f}s")
-        
-        return self.postprocess(self.h_output) # Postprocess the depth map
+        return self.postprocess(output) # Postprocess the depth map
     
     def run(self):
         """
         Real-time depth estimation
         """
         try:
+            fps_avg = 0.0
+            frame_count = 0
+            
             while True:
-                # frame = self.camera.frame # This causes bad performance
-                _, frame = self.camera.cap[0].read()
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("End of video stream or cannot fetch frame.")
+                    break
+                
+                t_start = time.time()
                 depth = self.infer(frame)
+                t_end = time.time()
+                
+                # Calculate FPS
+                fps = 1.0 / (t_end - t_start)
+                frame_count += 1
+                fps_avg = (fps_avg * (frame_count - 1) + fps) / frame_count
                 
                 if self.raw:
                     self.raw_depth = depth
                 else:
                     results = np.concatenate((frame, depth), axis=1)
+                    
+                    # Display metrics on screen
+                    infer_ms = self.infer_time * 1000
+                    cv2.putText(results, f"FPS: {fps:.1f} (Avg: {fps_avg:.1f})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(results, f"Infer Time: {infer_ms:.1f} ms", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     
                     if self.record:
                         self.video.write(results)
@@ -191,7 +200,7 @@ class DepthEngine:
                         cv2.imwrite(str(self.save_path / f'{datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")}.png'), results)
 
                     if self.stream:
-                        cv2.imshow('Depth', results) # This causes bad performance
+                        cv2.imshow('Depth', results) 
                         
                         if cv2.waitKey(1) == ord('q'):
                             break
@@ -207,6 +216,7 @@ class DepthEngine:
 if __name__ == '__main__':
     args = argparse.ArgumentParser()
     args.add_argument('--frame_rate', type=int, default=15, help='Frame rate of the camera')
+    args.add_argument('--video', type=str, default=None, help='Path to video file')
     args.add_argument('--raw', action='store_true', help='Use only the raw depth map')
     args.add_argument('--stream', action='store_true', help='Stream the results')
     args.add_argument('--record', action='store_true', help='Record the results')
@@ -215,6 +225,7 @@ if __name__ == '__main__':
     args = args.parse_args()
     
     depth = DepthEngine(
+        video=args.video,
         frame_rate=args.frame_rate,
         raw=args.raw,
         stream=args.stream, 

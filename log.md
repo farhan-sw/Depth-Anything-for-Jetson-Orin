@@ -1,0 +1,1 @@
+python3 depth.py --video /home/jetson/Documents/Github/Depth-Anything-for-Jetson-Orin/test_goldfish.mp4 --stream
